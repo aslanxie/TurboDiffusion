@@ -9,7 +9,9 @@ TurboDiffusion primarily uses [SageAttention](https://github.com/thu-ml/SageAtte
 
 Paper: [TurboDiffusion: Accelerating Video Diffusion Models by 100-200 Times](https://arxiv.org/pdf/2512.16093)
 
-**Note**: the checkpoints and paper are not finalized, and will be updated later to improve quality.
+**Note**: The current models are only trained on **long English prompts**. If you use other types of prompts, please refine them to get better performance.
+
+The checkpoints and paper are not finalized, and will be updated later to improve quality.
 
 <div align="center">
 <img src="assets/TurboDiffusion_speedup.png" width="99%"/>
