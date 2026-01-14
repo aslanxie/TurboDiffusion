@@ -49,6 +49,11 @@ def merge_weights(base_path, diff_base_path, diff_target_path, output_path, w):
             print(f"[INFO] Key '{key}' missing in diff models. Keeping Base tensor.")
             merged_sd[key] = base_tensor
 
+    for key, target_tensor in diff_target_sd.items():
+        if key not in merged_sd:
+            print(f"[INFO] Key '{key}' missing in base models. Keeping Target tensor.")
+            merged_sd[key] = target_tensor
+
     print("-" * 50)
     print(f"Saving merged model to {output_path}...")
     torch.save(merged_sd, output_path)
