@@ -34,3 +34,17 @@ PYTHONPATH=./turbodiffusion/	 python turbodiffusion/inference/wan2.1_t2v_infer.p
     --sla_topk 0.1
 ```
 
+## Optimize Methods
+
+### Initialization
+While enabling TurboDiffusion on Intel GPU, lots of walkaround is applied. For example:
+1. Intel GPUs don't support autocast to float32, like ```amp.autocast("cuda", dtype=torch.float32)```.  So, we're forcing the conversion manually.
+2. Use SLA to replace SageSLA which need extra effort to migrate CUDA kernel.
+3. Use apply_rotary_emb based on torch without Intel GPU flash_attn package.
+
+After enabled on B60, 4 steps sampling need take 83.57s. 
+
+### Optimize
+
+
+
