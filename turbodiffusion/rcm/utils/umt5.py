@@ -469,7 +469,7 @@ def load_model_torch(model, ckpt_path):
     if distributed.is_rank0():
         ckpt = easy_io.load(
             ckpt_path,
-            map_location="cuda",
+            map_location="cpu",
         )
         model.load_state_dict(ckpt, assign=True)
 
@@ -482,7 +482,7 @@ class UMT5EncoderModel:
         self,
         text_len=512,
         dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
+        device=torch.xpu.current_device(),
         checkpoint_path="models_t5_umt5-xxl-enc-bf16.pth",
         tokenizer_path="google/umt5-xxl",
     ):
@@ -496,7 +496,7 @@ class UMT5EncoderModel:
         assert checkpoint_path.endswith(".pth")
         self.model = load_model_torch(model, checkpoint_path).to(device).eval()
         # init tokenizer
-        self.tokenizer = HuggingfaceTokenizer(name=tokenizer_path, seq_len=text_len, clean="whitespace")
+        self.tokenizer = HuggingfaceTokenizer(name="./umt5-xxl", seq_len=text_len, clean="whitespace")
 
     def __call__(self, texts, device: Optional[torch.device] = None):
         if device is None:

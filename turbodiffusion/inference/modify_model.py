@@ -30,7 +30,7 @@ from rcm.networks.wan2pt2 import (
     WanSelfAttention as WanSelfAttention2pt2
 )
 
-from ops import FastLayerNorm, FastRMSNorm, Int8Linear
+from  FastNorm import FastLayerNorm, FastRMSNorm
 from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
@@ -47,7 +47,7 @@ def replace_attention(
     for module in model.modules():
         if type(module) is WanSelfAttention2pt1 or type(module) is WanSelfAttention2pt2:
             if attention_type == "sla":
-                module.attn_op.local_attn = SLA(head_dim=module.dim // module.num_heads, topk=sla_topk, BLKQ=128, BLKK=64)
+                module.attn_op.local_attn = SLA(head_dim=module.dim // module.num_heads, topk=sla_topk, BLKQ=256, BLKK=64)
             elif attention_type == "sagesla":
                 module.attn_op.local_attn = SageSLA(head_dim=module.dim // module.num_heads, topk=sla_topk)
     return model
@@ -81,7 +81,7 @@ def replace_linear_norm(
     return model
 
 
-tensor_kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+tensor_kwargs = {"device": "xpu", "dtype": torch.bfloat16}
 
 def select_model(model_name: str) -> torch.nn.Module:
     if model_name == "Wan2.1-1.3B":
@@ -136,6 +136,14 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
         net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
     replace_linear_norm(net, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
     net.load_state_dict(state_dict, assign=True)
+    freq_dim = 256
+    assert freq_dim % 2 == 0
+    half = freq_dim // 2
+    exponents = -torch.arange(half) / half
+    div_term_cpu = torch.pow(torch.tensor(10000.0), exponents)
+    div_term_cpu = div_term_cpu.bfloat16()
+    net.register_buffer( "div_term", div_term_cpu)
+    
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
     return net

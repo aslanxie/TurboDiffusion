@@ -23,10 +23,32 @@ import torch.amp as amp
 import torch.nn as nn
 from einops import rearrange, repeat
 
+# https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/layers/rotary.py
+def rotate_half(x, interleaved=False):
+    if not interleaved:
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat((-x2, x1), dim=-1)
+    else:
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return rearrange(torch.stack((-x2, x1), dim=-1), "... d two -> ... (d two)", two=2)
+        
+def apply_rotary_emb_torch(x, cos, sin, interleaved=False, inplace=False):
+    """
+    x: (batch_size, seqlen, nheads, headdim)
+    cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
+    """
+    ro_dim = cos.shape[-1] * 2
+    assert ro_dim <= x.shape[-1]
+    cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    sin = repeat(sin, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
+    return torch.cat(
+        [x[..., :ro_dim] * cos + rotate_half(x[..., :ro_dim], interleaved) * sin, x[..., ro_dim:]],
+        dim=-1,
+    )
 try:
     from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 except ImportError:
-    flash_apply_rotary_emb = None
+    flash_apply_rotary_emb = apply_rotary_emb_torch
     print("flash_attn is not installed.")
 
 from torch.distributed import ProcessGroup, get_process_group_ranks
@@ -78,9 +100,9 @@ class VideoRopePosition3DEmb(nn.Module):
         dim_h = self._dim_h
         dim_t = self._dim_t
 
-        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().cuda()
-        self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().cuda() / dim_h
-        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().cuda() / dim_t
+        self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().xpu()
+        self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().xpu() / dim_h
+        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().xpu() / dim_t
         self._is_initialized = True
 
     def generate_embeddings(
@@ -141,14 +163,15 @@ class VideoRopePosition3DEmb(nn.Module):
         return 0
 
 
-def sinusoidal_embedding_1d(dim, position):
+def sinusoidal_embedding_1d(div_term, position):
     # preprocess
-    assert dim % 2 == 0
-    half = dim // 2
-    position = position.type(torch.float64)
+    #assert dim % 2 == 0
+    #half = dim // 2
+    #position = position.type(torch.float64)
 
     # calculation
-    sinusoid = torch.outer(position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+    #exponents = torch.pow(10000, -torch.arange(half).to(position).div(half));
+    sinusoid = torch.outer(position, div_term)
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
@@ -208,7 +231,7 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("xpu", dtype=torch.bfloat16):
             return super().forward(x.float()).type_as(x)
 
 
@@ -395,21 +418,21 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast("cuda", dtype=torch.float32):
+        #assert e.dtype == torch.float32
+        with amp.autocast("xpu", dtype=torch.bfloat16):
             e = (self.modulation + e).chunk(6, dim=1)
-        assert e[0].dtype == torch.float32
+        #assert e[0].dtype == torch.float32
 
         # self-attention
         y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
-        with amp.autocast("cuda", dtype=torch.float32):
+        with amp.autocast("xpu", dtype=torch.bfloat16):
             x = x + y * e[2].type_as(x)
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).type_as(x))
-            with amp.autocast("cuda", dtype=torch.float32):
+            y = self.ffn((self.norm2(x) * (1 + e[4]) + e[3]).type_as(x))
+            with amp.autocast("xpu", dtype=torch.bfloat16):
                 x = x + y * e[5].type_as(x)
             return x
 
@@ -447,8 +470,8 @@ class Head(nn.Module):
             x(Tensor): Shape [B, L1, C]
             e(Tensor): Shape [B, C]
         """
-        assert e.dtype == torch.float32
-        with amp.autocast("cuda", dtype=torch.float32):
+        #assert e.dtype == torch.float32
+        with amp.autocast("xpu", dtype=torch.bfloat16):
             e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
             x = self.head(self.norm(x) * (1 + e[1]) + e[0])
         return x
@@ -668,11 +691,10 @@ class WanModel(nn.Module):
         seq_lens = torch.tensor([u.size(0) for u in x_B_L_D], dtype=torch.long)
 
         # time embeddings
-        with amp.autocast("cuda", dtype=torch.float32):
-            e_B_D = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t_B).float())
-            e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))
-            assert e_B_D.dtype == torch.float32 and e0_B_6_D.dtype == torch.float32
-
+       
+        emb = sinusoidal_embedding_1d(self.div_term, t_B)
+        e_B_D = self.time_embedding(emb)
+        e0_B_6_D = self.time_projection(e_B_D).unflatten(1, (6, self.dim))        
         # context
         context_lens = None
         context_B_L_D = self.text_embedding(crossattn_emb)

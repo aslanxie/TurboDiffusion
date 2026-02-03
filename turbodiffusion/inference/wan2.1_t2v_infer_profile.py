@@ -31,6 +31,9 @@ from rcm.tokenizers.wan2pt1 import Wan2pt1VAEInterface
 
 from modify_model import tensor_kwargs, create_model
 
+from torch.profiler import profile, ProfilerActivity, record_function
+
+
 torch._dynamo.config.suppress_errors = True
 
 
@@ -131,17 +134,21 @@ if __name__ == "__main__":
     net.eval()
     net.xpu()
     ts_sampling_begin = time.time()
-    with torch.inference_mode():
-        for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
-            v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.bfloat16() * ones * 1000).to(**tensor_kwargs), **condition)
-            x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
-                *x.shape,
-                dtype=torch.bfloat16,
-                device=tensor_kwargs["device"],
-                generator=generator,
-            )
-    torch.xpu.synchronize()
-
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU], with_stack=False,
+    experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)
+    ) as prof:
+        with torch.inference_mode():
+            for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
+                v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.bfloat16() * ones * 1000).to(**tensor_kwargs), **condition)
+                x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
+                    *x.shape,
+                    dtype=torch.bfloat16,
+                    device=tensor_kwargs["device"],
+                    generator=generator,
+                )
+        torch.xpu.synchronize()
+    print(f"samples data type: {x.dtype}")
+    #samples = x#.float()
     ts_sampling_end = time.time()
  
     with torch.no_grad():
@@ -153,3 +160,5 @@ if __name__ == "__main__":
 
     save_image_or_video(rearrange(to_show, "n b c t h w -> c t (n h) (b w)"), args.save_path, fps=16)
     print(f"Sampling time: {ts_sampling_end-ts_sampling_begin}s")
+    print(prof.key_averages(group_by_stack_n=8).table(sort_by="self_xpu_time_total", row_limit=100))
+    print(prof.key_averages(group_by_stack_n=8).table(sort_by="self_cpu_time_total", row_limit=100))

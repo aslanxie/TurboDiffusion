@@ -685,7 +685,7 @@ class Wan2pt1VAEInterface(VideoTokenizerInterface):
     def __init__(self, chunk_duration: int = 81, **kwargs):
         self.model = WanVAE(
             dtype=torch.bfloat16,
-            is_amp=False,
+            is_amp=False,  device="xpu",
             vae_pth=kwargs.get("vae_pth", ""),
             temporal_window=kwargs.get("temporal_window", 4),
         )

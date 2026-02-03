@@ -35,51 +35,69 @@ def _attn_fwd(
 
     qkv_offset = idx_bh * L * D
     lut_offset = (idx_bh * M_BLOCKS + idx_m) * topk
-    lse_offset = idx_bh * L
+
     offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, D)
 
-    Q_ptrs = Q + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
-    K_ptrs = K + qkv_offset + offs_n[None, :] * D + offs_d[:, None]
-    V_ptrs = V + qkv_offset + offs_n[:, None] * D + offs_d[None, :]
-    OS_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
     LUT_ptr = LUT + lut_offset
-    LSE_ptrs = LSE + lse_offset + offs_m
-    
+
+    # Q descriptor
+    q_base = Q + qkv_offset
+    q_desc = tl.make_tensor_descriptor(
+        base=q_base, shape=(L, D), strides=(D, 1), block_shape=(BLOCK_M, D),
+    )
+    coord_m = (idx_m * BLOCK_M).to(tl.int32)
+    q = q_desc.load([coord_m, 0])  # safe because of padding
+
+    # K and V descriptors
+    k_base = K + qkv_offset
+    v_base = V + qkv_offset
+
+    k_desc = tl.make_tensor_descriptor(
+        base=k_base, shape=(L, D), strides=(D, 1), block_shape=(BLOCK_N, D),
+    )
+    v_desc = tl.make_tensor_descriptor(
+        base=v_base, shape=(L, D), strides=(D, 1), block_shape=(BLOCK_N, D),
+    )
+
+    # Output descriptor
+    o_base = OS + qkv_offset
+    o_desc = tl.make_tensor_descriptor(
+        base=o_base, shape=(L, D), strides=(D, 1), block_shape=(BLOCK_M, D),
+    )
+
     m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
-    q = tl.load(Q_ptrs, mask=offs_m[:, None] < L)
+    scale_factor = qk_scale * 1.4426950408889634
+
     for block_idx in tl.range(topk):
-        idx_n = tl.load(LUT_ptr + block_idx)
-        n_mask = offs_n < L - idx_n * BLOCK_N
-        
-        k = tl.load(K_ptrs + idx_n * BLOCK_N * D, mask=n_mask[None, :])
-        qk = tl.dot(q, k) * (qk_scale * 1.4426950408889634)  # = 1 / ln(2)
-        if L - idx_n * BLOCK_N < BLOCK_N:
-            qk = tl.where(n_mask[None, :], qk, float("-inf"))
+        idx_n = tl.load(LUT_ptr + block_idx).to(tl.int64)
+        coord = (idx_n * BLOCK_N).to(tl.int32)
 
-        v = tl.load(V_ptrs + idx_n * BLOCK_N * D, mask=n_mask[:, None])
-        local_m = tl.max(qk, 1)
+        k_tile = k_desc.load([coord, 0])
+        v_tile = v_desc.load([coord, 0])
+
+        qk = tl.dot(q, tl.trans(k_tile)) * scale_factor
+
+        local_m = tl.max(qk, axis=1)
         new_m = tl.maximum(m_i, local_m)
-        qk = qk - new_m[:, None]
 
-        p = tl.math.exp2(qk)
-        l_ij = tl.sum(p, 1)
         alpha = tl.math.exp2(m_i - new_m)
+        qk_scaled = qk - new_m[:, None]
+        p = tl.math.exp2(qk_scaled)
+
+        l_ij = tl.sum(p, axis=1)
         o_s = o_s * alpha[:, None]
-        o_s += tl.dot(p.to(v.dtype), v)
+        o_s += tl.dot(p.to(v_tile.dtype), v_tile)
 
         l_i = l_i * alpha + l_ij
         m_i = new_m
 
     o_s = o_s / l_i[:, None]
-    tl.store(OS_ptrs, o_s.to(OS.type.element_ty), mask=offs_m[:, None] < L)
-    
-    m_i += tl.math.log2(l_i)
-    tl.store(LSE_ptrs, m_i, mask=offs_m < L)
+    o_desc.store([coord_m, 0], o_s.to(OS.dtype.element_ty))
 
 
 @triton.jit

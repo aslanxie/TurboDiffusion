@@ -16,6 +16,8 @@ Citation (please cite if you use this code):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
+import triton
 
 SAGESLA_ENABLED = True
 try:
@@ -31,7 +33,7 @@ try:
 except ImportError:
     SAGE2PP_ENABLED = False
 
-from .kernel import _attention
+from .kernel import _attention, _attn_fwd
 from .utils import get_block_map, get_cuda_arch
 
 
@@ -52,7 +54,7 @@ class SparseLinearAttention(nn.Module):
         self.topk = topk
         self.BLKQ = BLKQ
         self.BLKK = BLKK
-        self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.float32)
+        self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.bfloat16)
 
         if feature_map == 'elu':
             def elu_feature_map(x):
@@ -94,23 +96,59 @@ class SparseLinearAttention(nn.Module):
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
         
+        B, H, seq_len, D = q.shape
+
+        # Pad to multiple of BLKQ and BLKK
+        seq_len_padded_q = triton.cdiv(seq_len, self.BLKQ) * self.BLKQ
+        seq_len_padded_kv = triton.cdiv(seq_len, self.BLKK) * self.BLKK
+        pad_q = seq_len_padded_q - seq_len
+        pad_kv = seq_len_padded_kv - seq_len
+
+        if pad_q > 0:
+            q = F.pad(q, (0, 0, 0, pad_q), value=0.0)
+        if pad_kv > 0:
+            k = F.pad(k, (0, 0, 0, pad_kv), value=0.0)
+            v = F.pad(v, (0, 0, 0, pad_kv), value=0.0)
+
+        L_padded = max(seq_len_padded_q, seq_len_padded_kv)
+        
         sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
         q = q.to(self.dtype)
         k = k.to(self.dtype)
         v = v.to(self.dtype)
-        o_s = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
-        
-        q = self.feature_map_q(q).contiguous().to(self.dtype) # c_q
-        k = self.feature_map_k(k).contiguous().to(self.dtype) # c_k
-        def calc_linear(q, k, v):
-            kvsum = k.transpose(-1, -2) @ v
-            ksum = torch.sum(k, dim=-2, keepdim=True)
-            return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
-        o_l = calc_linear(q, k, v)
+        M_BLOCKS = triton.cdiv(L_padded, self.BLKQ)
 
-        with torch.amp.autocast('cuda', dtype=self.dtype):
-            o_l = self.proj_l(o_l)
+        o_s = torch.empty((B, H, L_padded, D), device=v.device, dtype=v.dtype)
+        lse = torch.empty((B, H, seq_len), device=q.device, dtype=torch.bfloat16)
+
+        grid = (M_BLOCKS, B * H)
+        _attn_fwd[grid](
+            q, k, v,
+            qk_scale = D ** -0.5,
+            topk     = real_topk,
+            LUT      = lut,
+            LSE      = lse,
+            OS       = o_s,
+            L        = L_padded,
+            M_BLOCKS = M_BLOCKS,
+            D        = D,
+            BLOCK_M  = self.BLKQ,
+            BLOCK_N  = self.BLKK,
+            num_warps   = 32,
+            num_stages  = 5,
+        )
+        
+        # Slice back for linear part
+        q_fm = self.feature_map_q(q[:, :, :seq_len, :]).contiguous().to(self.dtype)
+        k_fm = self.feature_map_k(k[:, :, :seq_len, :]).contiguous().to(self.dtype)
+
+        kvsum = k_fm.transpose(-1, -2) @ v[:, :, :seq_len, :]
+        ksum = torch.sum(k_fm, dim=-2, keepdim=True)
+        o_l = (q_fm @ kvsum) / (1e-6 + (q_fm * ksum).sum(dim=-1, keepdim=True))
+        o_l = self.proj_l(o_l)
+
+        o_s = o_s[:, :, :seq_len, :]
         o = (o_s + o_l).to(dtype).transpose(1, 2)
 
         if return_sparsity:
