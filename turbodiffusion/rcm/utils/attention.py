@@ -157,6 +157,8 @@ def attention(
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        
+        SDPA_BACKENDS = SDPBackend.MATH
 
         with sdpa_kernel_(backends=SDPA_BACKENDS):
             out = torch.nn.functional.scaled_dot_product_attention(
