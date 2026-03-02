@@ -122,7 +122,6 @@ class SparseLinearAttention(nn.Module):
         M_BLOCKS = triton.cdiv(L_padded, self.BLKQ)
 
         o_s = torch.empty((B, H, L_padded, D), device=v.device, dtype=v.dtype)
-        lse = torch.empty((B, H, seq_len), device=q.device, dtype=torch.bfloat16)
 
         grid = (M_BLOCKS, B * H)
         _attn_fwd[grid](
@@ -130,7 +129,6 @@ class SparseLinearAttention(nn.Module):
             qk_scale = D ** -0.5,
             topk     = real_topk,
             LUT      = lut,
-            LSE      = lse,
             OS       = o_s,
             L        = L_padded,
             M_BLOCKS = M_BLOCKS,

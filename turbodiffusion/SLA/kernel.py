@@ -23,7 +23,7 @@ def _attn_fwd(
     Q, K, V,
     qk_scale: tl.constexpr,
     topk: tl.constexpr,
-    LUT, LSE, OS,
+    LUT, OS,
     L: tl.constexpr,
     M_BLOCKS: tl.constexpr,
     D: tl.constexpr,

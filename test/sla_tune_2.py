@@ -73,7 +73,7 @@ def _attn_fwd(
     Q, K, V,
     qk_scale: tl.constexpr,
     topk: tl.constexpr,
-    LUT, LSE, OS,
+    LUT, OS,
     L: tl.constexpr,
     M_BLOCKS: tl.constexpr,
     D: tl.constexpr,
@@ -215,7 +215,6 @@ class SparseLinearAttention(nn.Module):
         M_BLOCKS = triton.cdiv(L_padded, BLKQ)
 
         o_s = torch.empty((B, H, L_padded, D), device=v.device, dtype=v.dtype)
-        lse = torch.empty((B, H, seq_len), device=q.device, dtype=torch.bfloat16)
 
         grid = (M_BLOCKS, B * H)
         #print(f"grid {grid}, q.shape {q.shape}")
@@ -225,7 +224,6 @@ class SparseLinearAttention(nn.Module):
             qk_scale = D ** -0.5,
             topk     = real_topk,
             LUT      = lut,
-            LSE      = lse,
             OS       = o_s,
             L        = L_padded,
             M_BLOCKS = M_BLOCKS,
