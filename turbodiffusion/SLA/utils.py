@@ -18,6 +18,11 @@ import triton
 import triton.language as tl
 
 
+def _device_sync(device: torch.device):
+    if device.type == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.synchronize()
+
+
 @triton.jit
 def compress_kernel(
     X, XM,
@@ -70,3 +75,109 @@ def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
 def get_cuda_arch(device_index):
     major, minor = torch.cuda.get_device_capability(device_index)
     return f"sm{major}{minor}"
+@triton.jit
+def triton_block_map_to_lut_kernel(map_ptr, lut_ptr, valid_block_num_ptr, num_block_k: tl.constexpr):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    q = tl.program_id(2)
+
+    map_ptr = map_ptr + (b * tl.num_programs(1) * tl.num_programs(2) + h * tl.num_programs(2) + q) * num_block_k
+    lut_ptr = lut_ptr + (b * tl.num_programs(1) * tl.num_programs(2) + h * tl.num_programs(2) + q) * num_block_k
+    valid_ptr = valid_block_num_ptr + b * tl.num_programs(1) * tl.num_programs(2) + h * tl.num_programs(2) + q
+
+    valid_block_num = 0
+    prev_block = 0
+    for i in range(num_block_k):
+        cur_block = tl.load(map_ptr + i)
+        if cur_block:
+            tl.store(lut_ptr + valid_block_num, i - prev_block)
+            prev_block = i
+            valid_block_num += 1
+
+    tl.store(valid_ptr, valid_block_num)
+
+
+def block_map_lut_triton(block_map):
+    assert block_map.dim() == 4
+    assert block_map.is_contiguous()
+    B, H, Q, K = block_map.shape
+    lut = torch.zeros((B, H, Q, K), dtype=torch.int32, device=block_map.device)
+    valid = torch.zeros((B, H, Q), dtype=torch.int32, device=block_map.device)
+    grid = (B, H, Q)
+    triton_block_map_to_lut_kernel[grid](block_map, lut, valid, K)
+    return lut, valid
+
+
+@triton.jit
+def qk_quantize(
+    x_ptr,
+    xm_ptr,
+    x_quant_ptr,
+    scale_ptr,
+    N: tl.constexpr,
+    D: tl.constexpr,
+    BS: tl.constexpr,
+    sm_scale: tl.constexpr,
+    fuse_mean: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    nb = tl.program_id(2)
+
+    H = tl.num_programs(1)
+    block_offset = b * H * N * D + h * N * D + nb * BS * D
+    offs_n = tl.arange(0, BS)
+    offs_d = tl.arange(0, D)
+
+    x_ptrs = x_ptr + block_offset + offs_n[:, None] * D + offs_d[None, :]
+    xmask = (nb * BS + offs_n[:, None]) < N
+    x = tl.load(x_ptrs, mask=xmask, other=0.0)
+
+    if fuse_mean:
+        xm_ptrs = xm_ptr + b * H * D + h * D + offs_d
+        x_mean = tl.load(xm_ptrs)
+        x = x - x_mean[None, :]
+        x = tl.where(xmask, x, 0.0)
+
+    x_fp32 = x.to(tl.float32) * sm_scale
+    scale = tl.max(tl.abs(x_fp32)) / 127.0
+    scale += 1e-7
+
+    x_int8 = x_fp32 / scale
+    x_int8 += 0.5 * tl.where(x_int8 >= 0, 1, -1)
+    x_int8 = x_int8.to(tl.int8)
+
+    x_quant_ptrs = x_quant_ptr + block_offset + offs_n[:, None] * D + offs_d[None, :]
+    tl.store(x_quant_ptrs, x_int8, mask=xmask)
+
+    NB = (N + BS - 1) // BS
+    scale_ptrs = scale_ptr + b * H * NB + h * NB + nb
+    tl.store(scale_ptrs, scale)
+
+
+def get_quant(x, x_mean, block_size, sm_scale=1.0):
+    x = x.contiguous()
+    B, H, N, D = x.shape
+    nblock = (N + block_size - 1) // block_size
+    x_quant = torch.empty_like(x, dtype=torch.int8)
+    x_scale = torch.empty((B, H, nblock), device=x.device, dtype=torch.float32)
+    grid = (B, H, nblock)
+    qk_quantize[grid](
+        x,
+        x_mean,
+        x_quant,
+        x_scale,
+        N=N,
+        D=D,
+        BS=block_size,
+        sm_scale=sm_scale,
+        fuse_mean=(x_mean is not None),
+    )
+    return x_quant, x_scale
+
+
+def get_vanilla_qk_quant(q, k, km=None, BLKQ=128, BLKK=64):
+    head_dim = q.shape[-1]
+    q_int8, q_scale = get_quant(q, None, BLKQ, sm_scale=(head_dim ** -0.5) * 1.44269504)
+    k_int8, k_scale = get_quant(k, km, BLKK, sm_scale=1.0)
+    return q_int8, q_scale, k_int8, k_scale

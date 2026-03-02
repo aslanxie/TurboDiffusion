@@ -30,7 +30,7 @@ from rcm.networks.wan2pt2 import (
     WanSelfAttention as WanSelfAttention2pt2
 )
 
-from  FastNorm import FastLayerNorm, FastRMSNorm
+from ops import FastLayerNorm, FastRMSNorm, Int8Linear
 from SLA import (
     SparseLinearAttention as SLA,
     SageSparseLinearAttention as SageSLA
@@ -146,6 +146,11 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
     
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
+
+    # P2 optimization: fuse q/k/v into single GEMM (only for non-quantized linears)
+    if not args.quant_linear:
+        net.fuse_all_qkv()
+
     return net
 
 

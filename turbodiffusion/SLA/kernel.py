@@ -255,6 +255,181 @@ def _attn_bwd_dkdv(
     tl.store(DV_ptrs, dv, mask=offs_n[:, None] < L)
     
 
+@triton.jit
+def _attn_fwd_sage(
+    QI, Q_SCALE, KI, K_SCALE, V,
+    LUT, VALID,
+    OS,
+    L: tl.constexpr,
+    M_BLOCKS: tl.constexpr,
+    N_BLOCKS: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    idx_m = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+
+    qkv_offset = idx_bh * L * D
+    lut_offset = (idx_bh * M_BLOCKS + idx_m) * N_BLOCKS
+    valid_offset = idx_bh * M_BLOCKS + idx_m
+    q_scale_offset = idx_bh * M_BLOCKS + idx_m
+    k_scale_offset = idx_bh * N_BLOCKS
+
+    offs_m = idx_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    q_ptrs = QI + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    q = tl.load(q_ptrs, mask=offs_m[:, None] < L, other=0).to(tl.float32)
+    q_scale = tl.load(Q_SCALE + q_scale_offset)
+    q = q * q_scale
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    valid_n = tl.load(VALID + valid_offset)
+    prev_block = 0
+
+    for block_idx in tl.range(N_BLOCKS):
+        delta = tl.load(LUT + lut_offset + block_idx)
+        idx_n = prev_block + delta
+        prev_block = idx_n
+
+        do_block = block_idx < valid_n
+        n_abs = idx_n * BLOCK_N + offs_n
+        n_mask = do_block & (n_abs < L)
+
+        k_ptrs = KI + qkv_offset + n_abs[:, None] * D + offs_d[None, :]
+        v_ptrs = V + qkv_offset + n_abs[:, None] * D + offs_d[None, :]
+
+        k = tl.load(k_ptrs, mask=n_mask[:, None], other=0).to(tl.float32)
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0)
+        k_scale = tl.load(K_SCALE + k_scale_offset + idx_n)
+        k = k * k_scale
+
+        qk = tl.dot(q, tl.trans(k))
+        qk = tl.where(n_mask[None, :], qk, float("-inf"))
+
+        local_m = tl.max(qk, axis=1)
+        new_m = tl.maximum(m_i, local_m)
+        alpha = tl.math.exp2(m_i - new_m)
+        p = tl.math.exp2(qk - new_m[:, None])
+
+        l_ij = tl.sum(p, axis=1)
+        o_s = o_s * alpha[:, None]
+        o_s += tl.dot(p.to(v.dtype), v)
+
+        l_i = l_i * alpha + l_ij
+        m_i = new_m
+
+    o_s = o_s / (l_i[:, None] + 1e-6)
+    o_ptrs = OS + qkv_offset + offs_m[:, None] * D + offs_d[None, :]
+    tl.store(o_ptrs, o_s.to(OS.dtype.element_ty), mask=offs_m[:, None] < L)
+
+
+@triton.jit
+def _attn_fwd_sage_tma(
+    QI, Q_SCALE, KI, K_SCALE, V,
+    L_orig,
+    H,
+    LUT,
+    OS,
+    L: tl.constexpr,
+    M_BLOCKS: tl.constexpr,
+    N_BLOCKS: tl.constexpr,
+    D: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Full-TMA + int8dot optimized variant for Intel XPU.
+    Uses tl.make_tensor_descriptor for all Q/K/V/O tensors (HW-accelerated block loads).
+    Uses int8×int8→int32 dot product for QK computation.
+    V uses a strided descriptor over the original [B,L,H,D] layout (zero-copy).
+    Sorted absolute LUT (ascending block indices), loops exactly TOPK times.
+    """
+    idx_m = tl.program_id(0).to(tl.int64)
+    idx_bh = tl.program_id(1).to(tl.int64)
+
+    qkv_offset = idx_bh * L * D
+    lut_offset = (idx_bh * M_BLOCKS + idx_m) * TOPK
+    q_scale_offset = idx_bh * M_BLOCKS + idx_m
+    k_scale_offset = idx_bh * N_BLOCKS
+
+    # Tensor descriptors for Q, K, O (contiguous [B*H, L_pad, D] layout)
+    q_desc = tl.make_tensor_descriptor(
+        base=QI + qkv_offset,
+        shape=(L, D),
+        strides=(D, 1),
+        block_shape=(BLOCK_M, D),
+    )
+    k_desc = tl.make_tensor_descriptor(
+        base=KI + qkv_offset,
+        shape=(L, D),
+        strides=(D, 1),
+        block_shape=(BLOCK_N, D),
+    )
+    o_desc = tl.make_tensor_descriptor(
+        base=OS + qkv_offset,
+        shape=(L, D),
+        strides=(D, 1),
+        block_shape=(BLOCK_M, D),
+    )
+
+    # Strided V descriptor: V is [B, L_orig, H, D] — zero-copy, no transpose needed.
+    idx_b = idx_bh // H
+    idx_h = idx_bh % H
+    v_stride_b = L_orig * H * D
+    v_stride_l = H * D
+    v_stride_h = D
+    v_base_ptr = V + idx_b * v_stride_b + idx_h * v_stride_h
+
+    v_desc = tl.make_tensor_descriptor(
+        base=v_base_ptr,
+        shape=(L_orig, D),
+        strides=(v_stride_l, 1),
+        block_shape=(BLOCK_N, D),
+    )
+
+    # Load Q via TMA
+    coord_m = (idx_m * BLOCK_M).to(tl.int32)
+    q_int8 = q_desc.load([coord_m, 0])
+    q_scale = tl.load(Q_SCALE + q_scale_offset)
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    o_s = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    for block_idx in tl.range(TOPK):
+        idx_n = tl.load(LUT + lut_offset + block_idx).to(tl.int64)
+        coord_n = (idx_n * BLOCK_N).to(tl.int32)
+
+        k_int8 = k_desc.load([coord_n, 0])
+        v_blk = v_desc.load([coord_n, 0])
+        k_scale = tl.load(K_SCALE + k_scale_offset + idx_n)
+
+        qk_int32 = tl.dot(q_int8, tl.trans(k_int8))
+        qk = qk_int32.to(tl.float32) * (q_scale * k_scale)
+
+        local_m = tl.max(qk, axis=1)
+        new_m = tl.maximum(m_i, local_m)
+        alpha = tl.math.exp2(m_i - new_m)
+        p = tl.math.exp2(qk - new_m[:, None])
+
+        l_ij = tl.sum(p, axis=1)
+        o_s = o_s * alpha[:, None] + tl.dot(p.to(v_blk.dtype), v_blk)
+
+        l_i = l_i * alpha + l_ij
+        m_i = new_m
+
+    o_s = o_s / (l_i[:, None] + 1e-6)
+
+    # Store O via TMA
+    o_desc.store([coord_m, 0], o_s.to(OS.dtype.element_ty))
+
+
 class _attention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):

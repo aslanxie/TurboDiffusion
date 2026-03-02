@@ -187,6 +187,11 @@ if __name__ == "__main__":
     high_noise_model.cuda()
     net = high_noise_model
     switched = False
+    # Clear caches before sampling (cross-attn KV + RoPE cos/sin)
+    if hasattr(high_noise_model, 'clear_caches'):
+        high_noise_model.clear_caches()
+    if hasattr(low_noise_model, 'clear_caches'):
+        low_noise_model.clear_caches()
     for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
         if t_cur.item() < args.boundary and not switched:
             high_noise_model.cpu()

@@ -17,7 +17,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+import math
 import triton
+import triton.language as tl
 
 SAGESLA_ENABLED = True
 try:
@@ -33,8 +35,8 @@ try:
 except ImportError:
     SAGE2PP_ENABLED = False
 
-from .kernel import _attention, _attn_fwd
-from .utils import get_block_map, get_cuda_arch
+from .kernel import _attention, _attn_fwd, _attn_fwd_sage_tma
+from .utils import get_block_map, get_cuda_arch, _device_sync, get_vanilla_qk_quant
 
 
 class SparseLinearAttention(nn.Module):
@@ -157,140 +159,172 @@ class SparseLinearAttention(nn.Module):
             return o
 
 
-class SageSparseLinearAttention(nn.Module):
-    def __init__(self, head_dim, topk, feature_map='softmax', use_bf16=True, tie_feature_map_qk=True):
-        R'''
-        Args:
-            head_dim: dimension of each head.
-            topk: ratio of keys selected for sparse attention, shared across all queries.
-            feature_map: feature map for linear attention, one of ['hedgehog', 'elu', 'relu', 'softmax'].
-            BLKQ: block size for query.
-            BLKK: block size for key.
-            use_bf16: whether to use bfloat16 (default) or float16 for computation. The conversion to bf16/fp16 is done inside the module.
-            tie_feature_map_qk: whether to use the same feature map for query and key.
-            timestep_adaptive_topk: whether to adaptively adjust topk during diffusion.
-        '''
-        assert SAGESLA_ENABLED, "Install SpargeAttn first to enable SageSLA."
+@triton.jit
+def transpose_pad_kernel(
+    x_in, x_out,
+    B: tl.constexpr, L: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+    L_PAD: tl.constexpr, BLOCK_L: tl.constexpr,
+):
+    idx_l = tl.program_id(0)
+    idx_bh = tl.program_id(1)
+    b = idx_bh // H
+    h = idx_bh % H
 
+    offs_l = idx_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_d = tl.arange(0, D)
+    mask = offs_l < L
+
+    in_offset = b * (L * H * D) + offs_l[:, None] * (H * D) + h * D + offs_d[None, :]
+    x = tl.load(x_in + in_offset, mask=mask[:, None], other=0.0)
+
+    out_offset = b * (H * L_PAD * D) + h * (L_PAD * D) + offs_l[:, None] * D + offs_d[None, :]
+    out_mask = offs_l < L_PAD
+    tl.store(x_out + out_offset, x, mask=out_mask[:, None])
+
+def fused_transpose_pad(x, l_pad, block_l=64):
+    B, L, H, D = x.shape
+    out = torch.empty((B, H, l_pad, D), device=x.device, dtype=x.dtype)
+    n_blocks_l = triton.cdiv(l_pad, block_l)
+    grid = (n_blocks_l, B * H)
+    transpose_pad_kernel[grid](x, out, B, L, H, D, l_pad, block_l)
+    return out
+
+
+@triton.jit
+def transpose_pad_kernel(
+    x_in, x_out,
+    B: tl.constexpr, L: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+    L_PAD: tl.constexpr, BLOCK_L: tl.constexpr,
+):
+    idx_l = tl.program_id(0)
+    idx_bh = tl.program_id(1)
+    b = idx_bh // H
+    h = idx_bh % H
+
+    offs_l = idx_l * BLOCK_L + tl.arange(0, BLOCK_L)
+    offs_d = tl.arange(0, D)
+    mask = offs_l < L
+
+    in_offset = b * (L * H * D) + offs_l[:, None] * (H * D) + h * D + offs_d[None, :]
+    x = tl.load(x_in + in_offset, mask=mask[:, None], other=0.0)
+
+    out_offset = b * (H * L_PAD * D) + h * (L_PAD * D) + offs_l[:, None] * D + offs_d[None, :]
+    out_mask = offs_l < L_PAD
+    tl.store(x_out + out_offset, x, mask=out_mask[:, None])
+
+
+def fused_transpose_pad(x, l_pad, block_l=64):
+    B, L, H, D = x.shape
+    out = torch.empty((B, H, l_pad, D), device=x.device, dtype=x.dtype)
+    n_blocks_l = triton.cdiv(l_pad, block_l)
+    grid = (n_blocks_l, B * H)
+    transpose_pad_kernel[grid](x, out, B, L, H, D, l_pad, block_l)
+    return out
+
+
+class SageSparseLinearAttention(nn.Module):
+    def __init__(self, head_dim, topk=0.1, feature_map='softmax', use_bf16=True, tie_feature_map_qk=True):
         super().__init__()
         self.dtype = torch.bfloat16 if use_bf16 else torch.float16
         self.topk = topk
-        self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.float32)
+        self.proj_l = nn.Linear(head_dim, head_dim, dtype=torch.bfloat16)
 
         if feature_map == 'elu':
             def elu_feature_map(x):
                 return F.elu(x) + 1
-            self.feature_map_q = elu_feature_map
-            self.feature_map_k = elu_feature_map
+            self.feature_map_q = self.feature_map_k = elu_feature_map
         elif feature_map == 'relu':
-            self.feature_map_q = nn.ReLU()
-            self.feature_map_k = nn.ReLU()
+            self.feature_map_q = self.feature_map_k = nn.ReLU()
         elif feature_map == 'softmax':
             def softmax_feature_map(x):
                 return F.softmax(x, dim=-1)
-            self.feature_map_q = softmax_feature_map
-            self.feature_map_k = softmax_feature_map
+            self.feature_map_q = self.feature_map_k = softmax_feature_map
         else:
-            raise NotImplementedError(f'Not supported feature map {feature_map}.')
+            raise ValueError(f"Unknown feature_map: {feature_map}")
 
         if tie_feature_map_qk:
             self.feature_map_k = self.feature_map_q
 
-        self.init_weights_()
+        nn.init.normal_(self.proj_l.weight)
+        nn.init.normal_(self.proj_l.bias)
 
-    def init_weights_(self):
-        with torch.no_grad():
-            nn.init.zeros_(self.proj_l.weight)
-            nn.init.zeros_(self.proj_l.bias)
-        
-    def forward(self, q, k, v, return_sparsity=False):
-        R'''
-        Args:
-            q: queries of shape (B, H, L, D).
-            k: keys of shape (B, H, L, D).
-            v: values of shape (B, H, L, D).
-            return_sparsity: whether to return the actual sparsity.
-            timestep: current timestep for diffusion models.
-            total_timesteps: total timesteps for diffusion models.
-        '''
-        
-        dtype = q.dtype
-        
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-        
-        arch = get_cuda_arch(q.device.index)
-        if arch == "sm90":
-            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=64, BLKK=128)
-        else:
-            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=128, BLKK=64)
+    def forward(self, q, k, v, BLKQ=64, BLKK=32, num_warps=8, num_stages=4, return_sparsity=False):
+        _device_sync(q.device)
 
-        q = q.to(self.dtype)
-        k = k.to(self.dtype)
-        v = v.to(self.dtype)
+        B, seq_len, H, D = q.shape
 
-        ########## SPARGE BEGIN ##########
+        # Calculate lcm to perfectly align view pooling
+        lcm_blk = (BLKQ * BLKK) // math.gcd(BLKQ, BLKK)
+        L_padded = triton.cdiv(seq_len, lcm_blk) * lcm_blk
 
-        km = k.mean(dim=-2, keepdim=True)
-        headdim = q.size(-1)
-        
-        if arch == "sm90":
-            q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 64, 128)
-        else:
-            q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q, k, km, 128, 64)
-        lut, valid_block_num = block_map_lut_triton(sparse_map)
-        scale = 1.0 / (headdim ** 0.5)
+        # Only transpose+pad Q and K; V is read directly via strided TMA descriptor (zero-copy).
+        q_tp = fused_transpose_pad(q, L_padded)
+        k_tp = fused_transpose_pad(k, L_padded)
 
-        assert headdim in [64, 128], "headdim should be in [64, 128]. For other headdim, you can use padding and specify the softmax scale."
+        # Block map: subtract global mean BEFORE view-based pooling to avoid diff regression.
+        km = k_tp.mean(dim=-2, keepdim=True)
+        pooled_q = q_tp.view(B, H, L_padded // BLKQ, BLKQ, D).mean(dim=3)
+        pooled_k = (k_tp - km).view(B, H, L_padded // BLKK, BLKK, D).mean(dim=3)
+        pooled_score = pooled_q @ pooled_k.transpose(-1, -2)
 
-        o_s = torch.empty_like(q)
+        K_blocks = pooled_score.shape[-1]
+        real_topk = min(K_blocks, int(self.topk * K_blocks))
+        topk_idx = torch.topk(pooled_score, real_topk, dim=-1, sorted=False).indices
+        lut, _ = torch.sort(topk_idx, dim=-1)
+        lut = lut.to(torch.int32).contiguous()
 
-        if arch in ("sm80", "sm86", "sm87"):
-            pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
-            v_fp16 = v.to(torch.float16)
-            qattn.qk_int8_sv_f16_accum_f16_block_sparse_attn_inst_buf_with_pv_threshold(
-                q_int8, k_int8, v_fp16, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, 1, False, 1, scale, 0
-            )
-        else:
-            b, h_kv, kv_len, head_dim = v.shape
-            padded_len = (kv_len + 127) // 128 * 128
-            v_transposed_permutted = torch.empty((b, h_kv, head_dim, padded_len), dtype=v.dtype, device=v.device)
-            fused.transpose_pad_permute_cuda(v, v_transposed_permutted, 1)
-            v_fp8 = torch.empty(v_transposed_permutted.shape, dtype=torch.float8_e4m3fn, device=v.device)
-            v_scale = torch.empty((b, h_kv, head_dim), dtype=torch.float32, device=v.device)
-            fused.scale_fuse_quant_cuda(v_transposed_permutted, v_fp8, v_scale, kv_len, 2.25, 1)
+        _device_sync(q.device)
 
-            if arch == "sm90":
-                qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_sm90(
-                    q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, q_scale, k_scale, v_scale, 1, False, 1, scale
-                )
-            else:
-                pvthreshold = torch.full((q.shape[-3],), 1e6, dtype=torch.float32, device=q.device)
-                if SAGE2PP_ENABLED:
-                    qk_int8_sv_f8_accum_f16_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
-                        q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
-                    )
-                else:
-                    qattn.qk_int8_sv_f8_accum_f32_block_sparse_attn_inst_buf_fuse_v_scale_with_pv_threshold(
-                        q_int8, k_int8, v_fp8, o_s, lut, valid_block_num, pvthreshold, q_scale, k_scale, v_scale, 1, False, 1, scale, 0
-                    )
+        # ---- Triton sparse attention --------------------------------- #
+        M_BLOCKS = triton.cdiv(L_padded, BLKQ)
+        N_BLOCKS = triton.cdiv(L_padded, BLKK)
+        o_s = torch.empty((B, H, L_padded, D), device=v.device, dtype=torch.bfloat16)
 
-        ########## SPARGE END ##########
+        q_int8, q_scale, k_int8, k_scale = get_vanilla_qk_quant(q_tp, k_tp, km, BLKQ=BLKQ, BLKK=BLKK)
 
-        q = self.feature_map_q(q).contiguous().to(self.dtype) # c_q
-        k = self.feature_map_k(k).contiguous().to(self.dtype) # c_k
-        def calc_linear(q, k, v):
-            kvsum = k.transpose(-1, -2) @ v
-            ksum = torch.sum(k, dim=-2, keepdim=True)
-            return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
-        o_l = calc_linear(q, k, v)
+        grid = (M_BLOCKS, B * H)
+        _attn_fwd_sage_tma[grid](
+            q_int8, q_scale, k_int8, k_scale,
+            v,                       # original [B, L, H, D] — zero-copy via strided TMA
+            seq_len,                  # L_orig for V descriptor
+            H,                       # num heads for V descriptor
+            lut,
+            o_s,
+            L=L_padded,
+            M_BLOCKS=M_BLOCKS,
+            N_BLOCKS=N_BLOCKS,
+            D=D,
+            TOPK=real_topk,
+            BLOCK_M=BLKQ,
+            BLOCK_N=BLKK,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
 
-        with torch.amp.autocast('cuda', dtype=self.dtype):
-            o_l = self.proj_l(o_l)
-        o = (o_s + o_l).to(dtype).transpose(1, 2)
+        _device_sync(q.device)
+
+        # ---- Linear attention ---------------------------------------- #
+        q_slice = q_tp[:, :, :seq_len, :]
+        k_slice = k_tp[:, :, :seq_len, :]
+        v_slice = v.transpose(1, 2)                       # lazy view, no copy
+
+        q_fm = self.feature_map_q(q_slice)
+        k_fm = self.feature_map_k(k_slice)
+
+        kvsum = k_fm.transpose(-1, -2) @ v_slice
+        ksum = torch.sum(k_fm, dim=-2, keepdim=True)
+
+        denom = torch.matmul(q_fm, ksum.transpose(-1, -2)) + 1e-6
+        o_l = torch.matmul(q_fm, kvsum)
+        o_l.div_(denom)
+        o_l = self.proj_l(o_l)
+
+        # In-place merge: avoids allocating a temporary for the sum.
+        o_l += o_s[:, :, :seq_len, :]
+        o = o_l.transpose(1, 2)
+
+        _device_sync(q.device)
 
         if return_sparsity:
-            return o, real_topk / sparse_map.shape[-1]
-        else:
-            return o
+            return o, real_topk / K_blocks
+        return o

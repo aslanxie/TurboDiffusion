@@ -59,9 +59,18 @@ from imaginaire.utils import log
 from rcm.utils.a2a_cp import MinimalA2AAttnOp
 from rcm.utils.selective_activation_checkpoint import CheckpointMode, SACConfig
 from rcm.utils.context_parallel import split_inputs_cp, cat_outputs_cp, cat_outputs_cp_with_grad, broadcast
+from ops import modulated_layernorm, gated_residual_add
 
 T5_CONTEXT_TOKEN_NUMBER = 512
 FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
+
+# Module-level RoPE cos/sin cache — avoids recomputing trig 240x per inference
+_rope_cos_sin_cache = {}
+
+def clear_rope_cache():
+    """Clear cached RoPE cos/sin. Call when video shape changes."""
+    global _rope_cos_sin_cache
+    _rope_cos_sin_cache = {}
 
 
 class VideoRopePosition3DEmb(nn.Module):
@@ -178,8 +187,10 @@ def sinusoidal_embedding_1d(div_term, position):
 
 def rope_apply(x, freqs):
     """
-    Optimized version of rope_apply using flash_attention's rotary embedding implementation.
-    This version processes the entire batch at once for efficiency.
+    Optimized RoPE with cached cos/sin and native-dtype computation.
+    Eliminates 4 copy_ ops per call (960 total per inference) by:
+    1. Caching cos/sin (avoids recomputing trig 240x)
+    2. Computing rotation in x.dtype directly (no fp32 round-trip)
 
     Args:
         x (Tensor): Input tensor with shape [batch_size, seq_len, n_heads, head_dim]
@@ -189,16 +200,16 @@ def rope_apply(x, freqs):
         Tensor: Rotary-embedded tensor with same shape as input
     """
     batch_size, seq_len, n_heads, head_dim = x.shape
+    cache_key = (seq_len, head_dim, x.dtype, x.device)
 
-    # freqs is already sharded to local seq_len under flattened CP
-    freqs = freqs.view(seq_len, head_dim // 2)
-    cos = torch.cos(freqs).to(torch.float32)
-    sin = torch.sin(freqs).to(torch.float32)
+    if cache_key not in _rope_cos_sin_cache:
+        f = freqs.view(seq_len, head_dim // 2)
+        cos = torch.cos(f).to(x.dtype)
+        sin = torch.sin(f).to(x.dtype)
+        _rope_cos_sin_cache[cache_key] = (cos, sin)
 
-    # Apply the rotation
-    rotated = flash_apply_rotary_emb(x.to(torch.float32), cos, sin, interleaved=True, inplace=False)
-
-    return rotated.to(x.dtype)
+    cos, sin = _rope_cos_sin_cache[cache_key]
+    return flash_apply_rotary_emb(x, cos, sin, interleaved=True, inplace=False)
 
 
 class WanRMSNorm(nn.Module):
@@ -245,6 +256,7 @@ class WanSelfAttention(nn.Module):
         self.qk_norm = qk_norm
         self.eps = eps
         self.qk_norm = qk_norm
+        self._qkv_fused = False
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -254,6 +266,27 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn_op = MinimalA2AAttnOp()
+
+    def fuse_qkv(self):
+        """Merge separate q/k/v linears into a single qkv linear.
+        Reduces 3 GEMM launches to 1. Call after loading weights."""
+        if self._qkv_fused or not isinstance(self.q, nn.Linear):
+            return
+        with torch.no_grad():
+            qkv = nn.Linear(self.dim, 3 * self.dim,
+                            bias=self.q.bias is not None,
+                            device=self.q.weight.device,
+                            dtype=self.q.weight.dtype)
+            qkv.weight.data.copy_(torch.cat([self.q.weight.data,
+                                              self.k.weight.data,
+                                              self.v.weight.data], dim=0))
+            if self.q.bias is not None:
+                qkv.bias.data.copy_(torch.cat([self.q.bias.data,
+                                                self.k.bias.data,
+                                                self.v.bias.data], dim=0))
+        self.qkv = qkv
+        del self.q, self.k, self.v
+        self._qkv_fused = True
 
     def init_weights(self):
         std = 1.0 / math.sqrt(self.dim)
@@ -280,14 +313,16 @@ class WanSelfAttention(nn.Module):
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
-        # query, key, value function
-        def qkv_fn(x):
+        if self._qkv_fused:
+            qkv_out = self.qkv(x)  # [B, L, 3*dim]
+            q_raw, k_raw, v = qkv_out.split(self.dim, dim=-1)
+            q = self.norm_q(q_raw.contiguous()).view(b, s, n, d)
+            k = self.norm_k(k_raw.contiguous()).view(b, s, n, d)
+            v = v.contiguous().view(b, s, n, d)
+        else:
             q = self.norm_q(self.q(x)).view(b, s, n, d)
             k = self.norm_k(self.k(x)).view(b, s, n, d)
             v = self.v(x).view(b, s, n, d)
-            return q, k, v
-
-        q, k, v = qkv_fn(x)
 
         x = self.attn_op(rope_apply(q, freqs), rope_apply(k, freqs), v)
 
@@ -301,6 +336,10 @@ class WanSelfAttention(nn.Module):
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+    def clear_kv_cache(self):
+        """Clear cached cross-attention K/V. Call between different prompts."""
+        self._kv_cache = None
+
     def forward(self, x, context, context_lens):
         r"""
         Args:
@@ -310,10 +349,17 @@ class WanT2VCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
+        # compute query
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
+
+        # compute key, value (cached: context is constant across timesteps)
+        kv_cache = getattr(self, '_kv_cache', None)
+        if kv_cache is None:
+            k = self.norm_k(self.k(context)).view(b, -1, n, d)
+            v = self.v(context).view(b, -1, n, d)
+            self._kv_cache = (k, v)
+            kv_cache = self._kv_cache
+        k, v = kv_cache
 
         # compute attention
         x = self.attn_op(q, k, v)
@@ -332,6 +378,10 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn_op_image = MinimalA2AAttnOp()
+
+    def clear_kv_cache(self):
+        """Clear cached cross-attention K/V. Call between different prompts."""
+        self._kv_cache = None
 
     def init_weights(self):
         super().init_weights()
@@ -352,17 +402,25 @@ class WanI2VCrossAttention(WanSelfAttention):
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
-        context_img = context[:, :image_context_length]
-        context = context[:, image_context_length:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
+        # compute query
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
-        k = self.norm_k(self.k(context)).view(b, -1, n, d)
-        v = self.v(context).view(b, -1, n, d)
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+
+        # compute key, value for text and image (cached: constant across timesteps)
+        kv_cache = getattr(self, '_kv_cache', None)
+        if kv_cache is None:
+            image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+            context_img = context[:, :image_context_length]
+            context_text = context[:, image_context_length:]
+            k = self.norm_k(self.k(context_text)).view(b, -1, n, d)
+            v = self.v(context_text).view(b, -1, n, d)
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
+            self._kv_cache = (k, v, k_img, v_img)
+            kv_cache = self._kv_cache
+        k, v, k_img, v_img = kv_cache
+
         img_x = self.attn_op_image(q, k_img, v_img)
         # compute attention
         x = self.attn_op(q, k, v)
@@ -418,25 +476,22 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
         """
-        #assert e.dtype == torch.float32
         with amp.autocast("xpu", dtype=torch.bfloat16):
             e = (self.modulation + e).chunk(6, dim=1)
-        #assert e[0].dtype == torch.float32
 
-        # self-attention
-        y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, freqs)
-        with amp.autocast("xpu", dtype=torch.bfloat16):
-            x = x + y * e[2].type_as(x)
+        # self-attention: fused modulated layernorm replaces norm1 + scale + shift
+        y = self.self_attn(modulated_layernorm(x, e[1], e[0], self.eps), seq_lens, freqs)
+        # fused gated residual: x + y * gate in single kernel
+        x = gated_residual_add(x, y, e[2])
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
-            y = self.ffn((self.norm2(x) * (1 + e[4]) + e[3]).type_as(x))
-            with amp.autocast("xpu", dtype=torch.bfloat16):
-                x = x + y * e[5].type_as(x)
-            return x
+        # cross-attention (no modulation on norm3)
+        x = x + self.cross_attn(self.norm3(x), context, context_lens)
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        # FFN: fused modulated layernorm replaces norm2 + scale + shift
+        y = self.ffn(modulated_layernorm(x, e[4], e[3], self.eps))
+        # fused gated residual: x + y * gate in single kernel
+        x = gated_residual_add(x, y, e[5])
+
         return x
 
 
@@ -617,6 +672,25 @@ class WanModel(nn.Module):
         self.init_weights()
 
         self.enable_selective_checkpoint(sac_config)
+
+    def fuse_all_qkv(self):
+        """Fuse q/k/v into single qkv linear in all self-attention blocks.
+        Reduces 3 GEMM launches to 1 per self-attention layer.
+        Only fuses nn.Linear (not Int8Linear). Call after loading weights."""
+        for block in self.blocks:
+            if type(block.self_attn) is WanSelfAttention and hasattr(block.self_attn, 'fuse_qkv'):
+                block.self_attn.fuse_qkv()
+
+    def clear_cross_attn_cache(self):
+        """Clear cached K/V in all cross-attention layers. Call between prompts."""
+        for block in self.blocks:
+            if hasattr(block.cross_attn, 'clear_kv_cache'):
+                block.cross_attn.clear_kv_cache()
+
+    def clear_caches(self):
+        """Clear all inference caches. Call between different prompts/video shapes."""
+        self.clear_cross_attn_cache()
+        clear_rope_cache()
 
     def forward(
         self,

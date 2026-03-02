@@ -18,7 +18,6 @@ import math
 import time
 
 import torch
-import intel_extension_for_pytorch as ipex
 from einops import rearrange, repeat
 from tqdm import tqdm
 
@@ -138,6 +137,8 @@ if __name__ == "__main__":
     experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)
     ) as prof:
         with torch.inference_mode():
+            # Clear caches before sampling (cross-attn KV + RoPE cos/sin)
+            net.clear_caches()
             for i, (t_cur, t_next) in enumerate(tqdm(list(zip(t_steps[:-1], t_steps[1:])), desc="Sampling", total=total_steps)):
                 v_pred = net(x_B_C_T_H_W=x.to(**tensor_kwargs), timesteps_B_T=(t_cur.bfloat16() * ones * 1000).to(**tensor_kwargs), **condition)
                 x = (1 - t_next) * (x - t_cur * v_pred) + t_next * torch.randn(
