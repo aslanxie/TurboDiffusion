@@ -1,7 +1,9 @@
 # Optimize TurboDiffusion Inference on Intel GPU
 
 
-4 steps sampleing running time is reduced from 83.57s to 21.70s on B60.
+**March 1, 2026**: Enable SageSLA on Intel GPU with Triton language kernel, and update PyTorch to 2.10 (with Triton to 3.6.0). Reduce the default sample running time to 13s - 14s on B60.
+
+**Feb 4, 2026**: Eanble SLA on Intel GPU, 4 steps sampleing running time is reduced from 83.57s to 21.70s on B60.
 
 
 ## Setup
@@ -27,6 +29,7 @@ umt5-xxl/
 
 2. Running below command line. Notes: we needn't build extra kernel and skip setup step.
 ```
+# SLA
 PYTHONPATH=./turbodiffusion/	 python turbodiffusion/inference/wan2.1_t2v_infer.py \
     --model Wan2.1-1.3B \
     --dit_path checkpoints/TurboWan2.1-T2V-1.3B-480P.pth \
@@ -35,6 +38,29 @@ PYTHONPATH=./turbodiffusion/	 python turbodiffusion/inference/wan2.1_t2v_infer.p
     --num_samples 1 \
     --num_steps 4 \
     --attention_type sla  \
+    --sla_topk 0.1
+
+# SageSLA w/ quant_linear
+PYTHONPATH=./turbodiffusion/  python turbodiffusion/inference/wan2.1_t2v_infer.py  \
+   --model Wan2.1-1.3B  \
+   --dit_path checkpoints/TurboWan2.1-T2V-1.3B-480P-quant.pth  \
+   --resolution 480p    \
+   --prompt "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."   \
+   --num_samples 1    \
+   --num_steps 4    \
+   --quant_linear  \
+   --attention_type sagesla   \
+   --sla_topk 0.1
+
+# SageSLA w/o quant_linear
+PYTHONPATH=./turbodiffusion/  python turbodiffusion/inference/wan2.1_t2v_infer.py \
+    --model Wan2.1-1.3B    \
+    --dit_path checkpoints/TurboWan2.1-T2V-1.3B-480P.pth  \
+    --resolution 480p  \
+    --prompt "A stylish woman walks down a Tokyo street filled with warm glowing neon and animated city signage. She wears a black leather jacket, a long red dress, and black boots, and carries a black purse. She wears sunglasses and red lipstick. She walks confidently and casually. The street is damp and reflective, creating a mirror effect of the colorful lights. Many pedestrians walk about."   \
+    --num_samples 1  \
+    --num_steps 4   \
+    --attention_type sagesla  \
     --sla_topk 0.1
 ```
 
