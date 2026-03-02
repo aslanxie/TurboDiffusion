@@ -285,7 +285,7 @@ class SageSparseLinearAttention(nn.Module):
         grid = (M_BLOCKS, B * H)
         _attn_fwd_sage_tma[grid](
             q_int8, q_scale, k_int8, k_scale,
-            v,                       # original [B, L, H, D] — zero-copy via strided TMA
+            v,                       # original [B, L, H, D] â€” zero-copy via strided TMA
             seq_len,                  # L_orig for V descriptor
             H,                       # num heads for V descriptor
             lut,
